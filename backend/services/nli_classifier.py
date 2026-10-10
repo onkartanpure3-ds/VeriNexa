@@ -1,34 +1,35 @@
 """
 Truth LenX — NLI Classifier (DeBERTa)
 
-Uses NLI model (default: cross-encoder/nli-deberta-v3-xsmall, memory-efficient) for:
+Uses cross-encoder/nli-deberta-v3-small (or configured NLI_MODEL) for Natural Language Inference:
 - Determines relationship between claim and evidence
-- Maps NLI labels to verification relations
-Includes memory safeguards and heuristic fallbacks for constrained cloud tiers (Render 512MB).
+- Maps NLI labels to verification relations (SUPPORTING, CONTRADICTING, RELATED, INSUFFICIENT)
+
+Optimized for CPU inference, single-threaded execution, bounded mini-batching,
+and strict memory logging.
 """
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
-from config import NLI_MODEL, LIGHTWEIGHT_MODE
+import numpy as np
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+from config import NLI_MODEL, NLI_BATCH_SIZE, TORCH_THREADS
 from models.schemas import EvidenceRelation, ModelState
 from services.provider_health import health_tracker
+from services.memory_tracker import log_memory, cleanup_memory
 
 logger = logging.getLogger("truthlenx.nli_classifier")
 
 
 class NLIClassifier:
-    """DeBERTa-based NLI classifier for claim-evidence relations with cloud safeguards."""
+    """DeBERTa-based NLI classifier for claim-evidence relations."""
 
-    # DeBERTa NLI label mapping (model-specific order)
+    # DeBERTa NLI label mapping (model-specific order: 0: contradiction, 1: entailment, 2: neutral)
     LABEL_MAP = {0: "contradiction", 1: "entailment", 2: "neutral"}
-
-    CONTRADICTION_KEYWORDS = {
-        "false", "hoax", "fake", "debunk", "debunked", "untrue", "denies", "denied",
-        "fabricated", "misleading", "incorrect", "refutes", "refuted", "inaccurate", "disproven"
-    }
 
     def __init__(self):
         self._model = None
@@ -36,53 +37,39 @@ class NLIClassifier:
         self._device = "cpu"
 
     def load_model(self) -> None:
-        """Load the NLI model with cloud memory safeguards."""
-        if LIGHTWEIGHT_MODE:
-            logger.info("LIGHTWEIGHT_MODE enabled: Using fast heuristic verification relation engine")
-            health_tracker.set_model_state("deberta_nli", ModelState.READY)
+        """Load the DeBERTa NLI model sequentially on CPU."""
+        if self._model is not None and self._tokenizer is not None:
+            logger.info("DeBERTa NLI model already loaded; reusing existing instance.")
             return
 
+        log_memory(f"Starting DeBERTa NLI model load: {NLI_MODEL}")
+        health_tracker.set_model_state("deberta_nli", ModelState.LOADING)
+
         try:
-            logger.info(f"Loading NLI model: {NLI_MODEL}")
-            health_tracker.set_model_state("deberta_nli", ModelState.LOADING)
-
-            import torch
-            try:
-                torch.set_num_threads(1)
-            except Exception:
-                pass
-
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            torch.set_num_threads(TORCH_THREADS)
 
             self._tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
             self._model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL)
-
-            if torch.cuda.is_available():
-                self._device = "cuda"
-                self._model = self._model.to(self._device)
-                logger.info("NLI loaded on GPU")
-            else:
-                self._device = "cpu"
-                logger.info("NLI loaded on CPU (1 thread)")
-
+            self._device = "cpu"
+            self._model.to(self._device)
             self._model.eval()
+
+            cleanup_memory()
             health_tracker.set_model_state("deberta_nli", ModelState.READY)
-            logger.info(f"NLI model [{NLI_MODEL}] READY")
+            log_memory(f"DeBERTa NLI model [{NLI_MODEL}] loaded successfully (READY)")
         except Exception as e:
-            health_tracker.set_model_state("deberta_nli", ModelState.READY)
-            logger.warning(
-                f"Memory/load notice for NLI model ({e}). "
-                f"Activated heuristic verification relation fallback."
-            )
             self._model = None
             self._tokenizer = None
+            health_tracker.set_model_state("deberta_nli", ModelState.ERROR)
+            mem = log_memory("DeBERTa NLI model load failed (ERROR)")
+            logger.error(f"Failed to load DeBERTa NLI model [{NLI_MODEL}] at RSS {mem:.1f} MiB: {e}", exc_info=True)
+            raise
 
     def classify(self, claim: str, evidence_text: str) -> dict[str, float]:
-        """Classify the NLI relationship between claim and evidence."""
+        """Classify the NLI relationship between claim and single evidence snippet."""
         if self._model is None or self._tokenizer is None:
-            return self._heuristic_scores(claim, evidence_text, 0.5)
+            raise RuntimeError("DeBERTa NLI model is not loaded or failed to initialize.")
 
-        import torch
         inputs = self._tokenizer(
             evidence_text[:512],
             claim[:256],
@@ -92,13 +79,9 @@ class NLIClassifier:
             padding=True,
         )
 
-        if self._device != "cpu":
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
-
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self._model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()[0]
 
         return {
             "contradiction": float(probs[0]),
@@ -109,9 +92,17 @@ class NLIClassifier:
     def classify_batch(
         self, claim: str, articles: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Classify NLI relations for a batch of articles against a claim."""
+        """
+        Classify NLI relations for a batch of articles against a claim.
+        Uses chunked mini-batching to keep CPU memory overhead strictly bounded.
+        """
         if not articles:
             return []
+
+        if self._model is None or self._tokenizer is None:
+            raise RuntimeError("DeBERTa NLI model is not ready for inference.")
+
+        log_memory(f"Before DeBERTa NLI inference (articles: {len(articles)})")
 
         results = []
         valid_indices = []
@@ -121,7 +112,6 @@ class NLIClassifier:
         for i, art in enumerate(articles):
             art_copy = dict(art)
             evidence_text = self._build_evidence_text(art)
-            sim = float(art_copy.get("semantic_similarity", 0.0))
 
             art_copy.update({
                 "nli_entailment": 0.0,
@@ -136,60 +126,46 @@ class NLIClassifier:
                 premise_texts.append(evidence_text[:384])
                 hypothesis_texts.append(claim[:256])
 
-        # Neural NLI Pass if model is available
-        if valid_indices and self._model is not None and self._tokenizer is not None:
-            try:
-                import torch
-                inputs = self._tokenizer(
-                    premise_texts,
-                    hypothesis_texts,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=256,
-                    padding=True,
-                )
+        if valid_indices:
+            # Process in small chunks (NLI_BATCH_SIZE) to bound peak tensor RAM
+            all_probs: list[np.ndarray] = []
+            chunk_size = max(1, NLI_BATCH_SIZE)
 
-                if self._device != "cpu":
-                    inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                for start_idx in range(0, len(valid_indices), chunk_size):
+                    end_idx = min(start_idx + chunk_size, len(valid_indices))
+                    chunk_premise = premise_texts[start_idx:end_idx]
+                    chunk_hypo = hypothesis_texts[start_idx:end_idx]
 
-                with torch.no_grad():
+                    inputs = self._tokenizer(
+                        chunk_premise,
+                        chunk_hypo,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=256,
+                        padding=True,
+                    )
+
                     outputs = self._model(**inputs)
                     probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+                    all_probs.extend(list(probs))
 
-                for idx, p in zip(valid_indices, probs):
-                    scores = {
-                        "contradiction": float(p[0]),
-                        "entailment": float(p[1]),
-                        "neutral": float(p[2]),
-                    }
-                    results[idx]["nli_entailment"] = scores["entailment"]
-                    results[idx]["nli_contradiction"] = scores["contradiction"]
-                    results[idx]["nli_neutral"] = scores["neutral"]
-                    results[idx]["relation"] = self._determine_relation(
-                        scores, results[idx].get("semantic_similarity", 0.0)
-                    )
-            except Exception as e:
-                logger.warning(f"Neural NLI inference notice: {e}, falling back to heuristic scoring")
-                for idx in valid_indices:
-                    sim = results[idx].get("semantic_similarity", 0.0)
-                    ev_text = self._build_evidence_text(results[idx])
-                    scores = self._heuristic_scores(claim, ev_text, sim)
-                    results[idx]["nli_entailment"] = scores["entailment"]
-                    results[idx]["nli_contradiction"] = scores["contradiction"]
-                    results[idx]["nli_neutral"] = scores["neutral"]
-                    results[idx]["relation"] = self._determine_relation(scores, sim)
-        elif valid_indices:
-            # Fallback heuristic NLI evaluation
-            for idx in valid_indices:
-                sim = results[idx].get("semantic_similarity", 0.0)
-                ev_text = self._build_evidence_text(results[idx])
-                scores = self._heuristic_scores(claim, ev_text, sim)
+            for idx, p in zip(valid_indices, all_probs):
+                scores = {
+                    "contradiction": float(p[0]),
+                    "entailment": float(p[1]),
+                    "neutral": float(p[2]),
+                }
                 results[idx]["nli_entailment"] = scores["entailment"]
                 results[idx]["nli_contradiction"] = scores["contradiction"]
                 results[idx]["nli_neutral"] = scores["neutral"]
-                results[idx]["relation"] = self._determine_relation(scores, sim)
+                results[idx]["relation"] = self._determine_relation(
+                    scores, results[idx].get("semantic_similarity", 0.0)
+                )
 
-        # Log summary
+        cleanup_memory()
+        log_memory("After DeBERTa NLI inference")
+
         relations = [r.get("relation", "") for r in results]
         logger.info(
             f"NLI classified {len(results)} articles: "
@@ -200,20 +176,6 @@ class NLIClassifier:
         )
 
         return results
-
-    def _heuristic_scores(self, claim: str, evidence_text: str, sim: float) -> dict[str, float]:
-        """Compute heuristic NLI relation probabilities based on semantic similarity and polarity."""
-        text_lower = evidence_text.lower()
-        has_contradiction_signal = any(word in text_lower for word in self.CONTRADICTION_KEYWORDS)
-
-        if has_contradiction_signal and sim >= 0.35:
-            return {"contradiction": 0.65, "entailment": 0.15, "neutral": 0.20}
-        elif sim >= 0.50:
-            return {"contradiction": 0.08, "entailment": 0.72, "neutral": 0.20}
-        elif sim >= 0.35:
-            return {"contradiction": 0.12, "entailment": 0.48, "neutral": 0.40}
-        else:
-            return {"contradiction": 0.10, "entailment": 0.20, "neutral": 0.70}
 
     @staticmethod
     def _determine_relation(scores: dict[str, float], semantic_similarity: float = 0.0) -> str:
@@ -234,11 +196,14 @@ class NLIClassifier:
         if contra >= 0.45 and contra > entail and semantic_similarity >= 0.35:
             return EvidenceRelation.CONTRADICTING.value
 
-        # 3. Supporting evidence:
-        if entail >= 0.45 and entail > contra:
+        # 3. Supporting evidence
+        if entail >= 0.50 and entail > contra:
             return EvidenceRelation.SUPPORTING.value
 
-        if semantic_similarity >= 0.55 and entail >= 0.20 and contra < 0.25:
+        if semantic_similarity >= 0.60 and entail >= 0.20 and contra < 0.25:
+            return EvidenceRelation.SUPPORTING.value
+
+        if semantic_similarity >= 0.45 and entail >= 0.30 and contra < 0.20:
             return EvidenceRelation.SUPPORTING.value
 
         # 4. Related / Insufficient

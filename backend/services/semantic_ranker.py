@@ -1,81 +1,91 @@
 """
-Truth LenX — Semantic Ranker
+Truth LenX — Semantic Ranker (MPNet)
 
-Uses sentence-transformers (default: all-MiniLM-L6-v2, memory-efficient) for:
+Uses sentence-transformers/all-mpnet-base-v2 (or configured MPNET_MODEL) for:
 - Claim embedding
 - Article embedding
 - Semantic similarity scoring
 - Evidence ranking by relevance
-Includes graceful fallback for low-memory environments (Render 512MB free tier).
+
+Optimized for single-model CPU inference, single-threaded execution,
+configurable batch sizes, and strict memory logging.
 """
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 import numpy as np
+import torch
 
-from config import MPNET_MODEL, TOP_K_EVIDENCE, LIGHTWEIGHT_MODE
+from config import MPNET_MODEL, TOP_K_EVIDENCE, RANKER_BATCH_SIZE, TORCH_THREADS
 from models.schemas import ModelState
 from services.provider_health import health_tracker
+from services.memory_tracker import log_memory, cleanup_memory
 
 logger = logging.getLogger("truthlenx.semantic_ranker")
 
 
 class SemanticRanker:
-    """Semantic embedding and ranking engine with cloud memory safeguards."""
+    """MPNet-based semantic embedding and ranking engine."""
 
     def __init__(self):
         self._model = None
 
     def load_model(self) -> None:
-        """Load the embedding model safely with memory constraints."""
-        if LIGHTWEIGHT_MODE:
-            logger.info("LIGHTWEIGHT_MODE enabled: Using fast lexical token ranking engine")
-            health_tracker.set_model_state("mpnet", ModelState.READY)
+        """Load the MPNet embedding model sequentially on CPU."""
+        if self._model is not None:
+            logger.info("MPNet model already loaded; reusing existing instance.")
             return
 
-        try:
-            logger.info(f"Loading embedding model: {MPNET_MODEL}")
-            health_tracker.set_model_state("mpnet", ModelState.LOADING)
+        log_memory(f"Starting MPNet model load: {MPNET_MODEL}")
+        health_tracker.set_model_state("mpnet", ModelState.LOADING)
 
-            # Limit PyTorch CPU threads to 1 to prevent memory spikes in containers
-            try:
-                import torch
-                torch.set_num_threads(1)
-            except Exception:
-                pass
+        try:
+            # Enforce single-threaded CPU execution to reduce thread stack allocations
+            torch.set_num_threads(TORCH_THREADS)
 
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(MPNET_MODEL)
+
+            self._model = SentenceTransformer(MPNET_MODEL, device="cpu")
+            self._model.eval()
+
+            cleanup_memory()
             health_tracker.set_model_state("mpnet", ModelState.READY)
-            logger.info(f"Embedding model [{MPNET_MODEL}] READY")
+            log_memory(f"MPNet model [{MPNET_MODEL}] loaded successfully (READY)")
         except Exception as e:
-            health_tracker.set_model_state("mpnet", ModelState.READY)
-            logger.warning(
-                f"Memory/load notice for embedding model ({e}). "
-                f"Activated fast lexical semantic ranking fallback."
-            )
             self._model = None
+            health_tracker.set_model_state("mpnet", ModelState.ERROR)
+            mem = log_memory("MPNet model load failed (ERROR)")
+            logger.error(f"Failed to load MPNet model [{MPNET_MODEL}] at RSS {mem:.1f} MiB: {e}", exc_info=True)
+            raise
 
     def embed_claim(self, claim: str) -> np.ndarray:
         """Encode a claim into an embedding vector."""
         if self._model is None:
-            return np.zeros(384)
-        return self._model.encode(claim, convert_to_numpy=True, normalize_embeddings=True)
+            raise RuntimeError("MPNet model is not loaded or failed to initialize.")
+
+        with torch.inference_mode():
+            return self._model.encode(
+                claim,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
 
     def embed_texts(self, texts: list[str]) -> np.ndarray:
-        """Encode a batch of texts into embedding vectors."""
+        """Encode a batch of texts into embedding vectors with bounded batch size."""
         if self._model is None:
-            return np.zeros((len(texts), 384))
-        return self._model.encode(
-            texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            batch_size=16,
-            show_progress_bar=False,
-        )
+            raise RuntimeError("MPNet model is not loaded or failed to initialize.")
+
+        with torch.inference_mode():
+            return self._model.encode(
+                texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=RANKER_BATCH_SIZE,
+                show_progress_bar=False,
+            )
 
     def rank_articles(
         self, claim: str, articles: list[dict[str, Any]]
@@ -87,72 +97,35 @@ class SemanticRanker:
         if not articles:
             return []
 
-        # If model is not loaded (or lightweight mode), use high-accuracy lexical token similarity
         if self._model is None:
-            ranked = []
-            for art in articles:
-                text = self._build_article_text(art)
-                sim = self._fallback_similarity(claim, text)
-                art_copy = dict(art)
-                art_copy["semantic_similarity"] = float(sim)
-                ranked.append(art_copy)
+            raise RuntimeError("MPNet model is not ready for ranking.")
 
-            ranked.sort(key=lambda x: x["semantic_similarity"], reverse=True)
-            logger.info(
-                f"Lexical ranked {len(ranked)} articles, "
-                f"top similarity: {ranked[0]['semantic_similarity']:.3f}"
-            )
-            return ranked[:TOP_K_EVIDENCE]
+        log_memory(f"Before MPNet ranking inference (articles: {len(articles)})")
 
-        # Neural embedding ranking
-        try:
-            article_texts = [self._build_article_text(art) for art in articles]
-            claim_embedding = self.embed_claim(claim)
-            article_embeddings = self.embed_texts(article_texts)
+        article_texts = [self._build_article_text(art) for art in articles]
+        claim_embedding = self.embed_claim(claim)
+        article_embeddings = self.embed_texts(article_texts)
 
-            similarities = np.dot(article_embeddings, claim_embedding)
+        # Compute cosine similarities (embeddings are L2-normalized)
+        similarities = np.dot(article_embeddings, claim_embedding)
 
-            ranked = []
-            for i, art in enumerate(articles):
-                art_copy = dict(art)
-                art_copy["semantic_similarity"] = float(similarities[i])
-                ranked.append(art_copy)
+        ranked = []
+        for i, art in enumerate(articles):
+            art_copy = dict(art)
+            art_copy["semantic_similarity"] = float(similarities[i])
+            ranked.append(art_copy)
 
-            ranked.sort(key=lambda x: x["semantic_similarity"], reverse=True)
-            logger.info(
-                f"Ranked {len(ranked)} articles, "
-                f"top similarity: {ranked[0]['semantic_similarity']:.3f}"
-            )
-            return ranked[:TOP_K_EVIDENCE]
-        except Exception as err:
-            logger.warning(f"Embedding ranking notice: {err}, falling back to lexical similarity")
-            ranked = []
-            for art in articles:
-                text = self._build_article_text(art)
-                sim = self._fallback_similarity(claim, text)
-                art_copy = dict(art)
-                art_copy["semantic_similarity"] = float(sim)
-                ranked.append(art_copy)
-            ranked.sort(key=lambda x: x["semantic_similarity"], reverse=True)
-            return ranked[:TOP_K_EVIDENCE]
+        ranked.sort(key=lambda x: x["semantic_similarity"], reverse=True)
 
-    @staticmethod
-    def _fallback_similarity(claim: str, text: str) -> float:
-        """Fast lexical token overlap similarity for low-memory environments."""
-        stopwords = {
-            "the", "a", "an", "is", "in", "on", "of", "and", "to", "for", "with",
-            "at", "by", "from", "up", "about", "into", "over", "after", "that", "this"
-        }
-        claim_words = set(re.findall(r"\w+", claim.lower())) - stopwords
-        text_words = set(re.findall(r"\w+", text.lower())) - stopwords
-        if not claim_words or not text_words:
-            return 0.15
+        cleanup_memory()
+        log_memory(f"After MPNet ranking inference (retained top: {min(len(ranked), TOP_K_EVIDENCE)})")
 
-        intersection = claim_words.intersection(text_words)
-        overlap = len(intersection) / min(len(claim_words), len(text_words))
-        # Scaled cosine-like approximation
-        score = 0.25 + 0.65 * overlap
-        return round(min(1.0, max(0.1, score)), 3)
+        logger.info(
+            f"Ranked {len(ranked)} articles with MPNet, "
+            f"top similarity: {ranked[0]['semantic_similarity']:.3f}"
+        )
+
+        return ranked[:TOP_K_EVIDENCE]
 
     @staticmethod
     def _build_article_text(article: dict) -> str:
@@ -161,7 +134,7 @@ class SemanticRanker:
         """
         title = (article.get("title") or "").strip()
         desc = (article.get("description") or "").strip()
-        
+
         if title and desc and desc != title:
-            return f"{title}. {desc[:160]}"
+            return f"{title}. {desc[:200]}"
         return title or desc or "No content available"

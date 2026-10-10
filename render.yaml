@@ -2,6 +2,7 @@ services:
   - type: web
     name: verinexa-backend
     runtime: python
+    plan: starter # Minimum 1 GB RAM required for all-mpnet-base-v2 + DeBERTa NLI pipeline
     rootDir: backend
     buildCommand: "./render-build.sh"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
@@ -18,12 +19,22 @@ services:
       - key: GOOGLE_NEWS_ENABLED
         value: "true"
       - key: MPNET_MODEL
-        value: sentence-transformers/all-MiniLM-L6-v2
+        value: sentence-transformers/all-mpnet-base-v2
       - key: NLI_MODEL
-        value: cross-encoder/nli-deberta-v3-xsmall
-      - key: LIGHTWEIGHT_MODE
-        value: "false"
+        value: cross-encoder/nli-deberta-v3-small
+      - key: TORCH_THREADS
+        value: "1"
       - key: OMP_NUM_THREADS
         value: "1"
       - key: MKL_NUM_THREADS
         value: "1"
+      - key: MAX_CONCURRENT_VERIFICATIONS
+        value: "1"
+      - key: RANKER_BATCH_SIZE
+        value: "8"
+      - key: NLI_BATCH_SIZE
+        value: "4"
+      - key: MAX_CANDIDATES
+        value: "15"
+      - key: TOP_K_EVIDENCE
+        value: "8"

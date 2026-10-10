@@ -10,7 +10,7 @@ env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
 
 # ─── Evidence Window ───────────────────────────────────────────────────
-EVIDENCE_WINDOW_DAYS = 3650
+EVIDENCE_WINDOW_DAYS = int(os.getenv("EVIDENCE_WINDOW_DAYS", "30"))
 
 def get_evidence_window():
     """Return the 30-day evidence window boundaries."""
@@ -28,10 +28,17 @@ GDELT_URL = os.getenv("GDELT_URL", os.getenv("GDLET_URL", "https://api.gdeltproj
 GDELT_ENABLED = os.getenv("GDELT_ENABLED", "true").lower() == "true"
 GOOGLE_NEWS_ENABLED = os.getenv("GOOGLE_NEWS_ENABLED", "true").lower() == "true"
 
-# ─── Model Paths & Cloud Optimization ──────────────────────────────────
-LIGHTWEIGHT_MODE = os.getenv("LIGHTWEIGHT_MODE", "false").lower() == "true"
+# ─── Model Paths (Option B: Memory-Optimized for 512MB Free Tier) ──────
 MPNET_MODEL = os.getenv("MPNET_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 NLI_MODEL = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-xsmall")
+
+# ─── Concurrency & Memory Controls ────────────────────────────────────
+TORCH_THREADS = int(os.getenv("TORCH_THREADS", "1"))
+MAX_CONCURRENT_VERIFICATIONS = int(os.getenv("MAX_CONCURRENT_VERIFICATIONS", "1"))
+RANKER_BATCH_SIZE = int(os.getenv("RANKER_BATCH_SIZE", "8"))
+NLI_BATCH_SIZE = int(os.getenv("NLI_BATCH_SIZE", "4"))
+MAX_CANDIDATE_ARTICLES = int(os.getenv("MAX_CANDIDATES", "15"))
+TOP_K_EVIDENCE = int(os.getenv("TOP_K_EVIDENCE", "8"))
 
 # ─── Evidence Scoring Weights (configurable) ──────────────────────────
 SCORING_WEIGHTS = {
@@ -52,10 +59,6 @@ FUSION_THRESHOLDS = {
     "min_evidence_strength": 0.40,
     "classification_threshold": 0.50, # >= 0.50 is REAL, < 0.50 is FAKE
 }
-
-# ─── Retrieval Settings ──────────────────────────────────────────────
-TOP_K_EVIDENCE = int(os.getenv("TOP_K_EVIDENCE", "10"))
-MAX_CANDIDATE_ARTICLES = int(os.getenv("MAX_CANDIDATES", "25"))
 
 # ─── Server Settings ─────────────────────────────────────────────────
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
