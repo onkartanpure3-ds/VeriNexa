@@ -17,3 +17,13 @@ services:
         value: "true"
       - key: GOOGLE_NEWS_ENABLED
         value: "true"
+      - key: MPNET_MODEL
+        value: sentence-transformers/all-MiniLM-L6-v2
+      - key: NLI_MODEL
+        value: cross-encoder/nli-deberta-v3-xsmall
+      - key: LIGHTWEIGHT_MODE
+        value: "false"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"

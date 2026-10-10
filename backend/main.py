@@ -55,11 +55,17 @@ async def lifespan(app: FastAPI):
     # Load Source Credibility DB
     source_credibility.load_database()
     
-    # Load ML Models synchronously at startup to avoid lazy loading delays later
-    semantic_ranker.load_model()
-    nli_classifier.load_model()
-    
-    logger.info("Truth LenX startup complete")
+    # Non-blocking asynchronous model loading so server binds port immediately on Render
+    async def load_models_background():
+        try:
+            semantic_ranker.load_model()
+            nli_classifier.load_model()
+            logger.info("Truth LenX model initialization routine complete")
+        except Exception as err:
+            logger.warning(f"Model initialization routine notice: {err}")
+
+    asyncio.create_task(load_models_background())
+    logger.info("Truth LenX startup complete — port listener active")
     
     yield
     
