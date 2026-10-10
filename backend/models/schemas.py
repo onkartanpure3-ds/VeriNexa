@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ─── Enumerations ─────────────────────────────────────────────────────
@@ -146,6 +146,8 @@ class VerificationResponse(BaseModel):
     model_status: dict[str, str] = Field(default_factory=dict)
     article_analysis: Optional[ArticleAnalysis] = None
     extraction_metadata: Optional[ExtractionMetadata] = None
+
+    model_config = ConfigDict(protected_namespaces=())
 
 
 # ─── Request Models ──────────────────────────────────────────────────

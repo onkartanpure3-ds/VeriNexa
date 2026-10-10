@@ -28,9 +28,10 @@ GDELT_URL = os.getenv("GDELT_URL", os.getenv("GDLET_URL", "https://api.gdeltproj
 GDELT_ENABLED = os.getenv("GDELT_ENABLED", "true").lower() == "true"
 GOOGLE_NEWS_ENABLED = os.getenv("GOOGLE_NEWS_ENABLED", "true").lower() == "true"
 
-# ─── Model Paths ──────────────────────────────────────────────────────
-MPNET_MODEL = "sentence-transformers/all-mpnet-base-v2"
-NLI_MODEL = "cross-encoder/nli-deberta-v3-small"
+# ─── Model Paths & Cloud Optimization ──────────────────────────────────
+LIGHTWEIGHT_MODE = os.getenv("LIGHTWEIGHT_MODE", "false").lower() == "true"
+MPNET_MODEL = os.getenv("MPNET_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+NLI_MODEL = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-xsmall")
 
 # ─── Evidence Scoring Weights (configurable) ──────────────────────────
 SCORING_WEIGHTS = {
