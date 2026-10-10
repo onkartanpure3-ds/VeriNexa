@@ -21,8 +21,10 @@ def get_evidence_window():
         "to": now.isoformat(),
     }
 
-# ─── API Keys ──────────────────────────────────────────────────────────
+# ─── API Keys & Provider Endpoints ─────────────────────────────────────
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+NEWSAPI_URL = os.getenv("NEWSAPI_URL", os.getenv("NEWAPI_URL", "https://newsapi.org/v2/everything"))
+GDELT_URL = os.getenv("GDELT_URL", os.getenv("GDLET_URL", "https://api.gdeltproject.org/api/v2/doc/doc"))
 GDELT_ENABLED = os.getenv("GDELT_ENABLED", "true").lower() == "true"
 GOOGLE_NEWS_ENABLED = os.getenv("GOOGLE_NEWS_ENABLED", "true").lower() == "true"
 

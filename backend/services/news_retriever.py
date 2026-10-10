@@ -20,6 +20,8 @@ from bs4 import BeautifulSoup
 
 from config import (
     NEWSAPI_KEY,
+    NEWSAPI_URL,
+    GDELT_URL,
     GDELT_ENABLED,
     GOOGLE_NEWS_ENABLED,
     EVIDENCE_WINDOW_DAYS,
@@ -211,7 +213,7 @@ class NewsRetriever:
             clean_q = query.strip()
             if not clean_q:
                 continue
-            url = "https://newsapi.org/v2/everything"
+            url = NEWSAPI_URL
             params = {
                 "q": clean_q,
                 "sortBy": "relevancy",
@@ -259,7 +261,7 @@ class NewsRetriever:
         if not query:
             return []
 
-        url = "https://api.gdeltproject.org/api/v2/doc/doc"
+        url = GDELT_URL
         # GDELT DOC 2.0 max valid timespan is <= 90d (e.g. 30d or 14d)
         params = {
             "query": query,
