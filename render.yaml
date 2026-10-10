@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: verinexa-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: "./render-build.sh"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: "/health"
+    envVars:
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: NEWSAPI_URL
+        value: https://newsapi.org/v2/everything
+      - key: GDELT_URL
+        value: https://api.gdeltproject.org/api/v2/doc/doc
+      - key: GDELT_ENABLED
+        value: "true"
+      - key: GOOGLE_NEWS_ENABLED
+        value: "true"

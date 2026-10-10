@@ -206,6 +206,17 @@ async def run_verification_pipeline(
 
 # ─── API Endpoints ─────────────────────────────────────────────────────
 
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render and monitoring."""
+    return {
+        "status": "healthy",
+        "service": "VeriNexa API",
+        "version": "2.0.0",
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+    }
+
 @app.post("/api/verify/claim", response_model=VerificationResponse)
 async def verify_claim(request: VerifyClaimRequest):
     """Verify a short claim or headline directly."""
